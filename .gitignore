@@ -1,0 +1,86 @@
+# ============================================================
+# 本项目是大模型项目，会把「不该进 git 的东西」放大好几个量级。
+# 最典型的就是 HF/ModelScope 模型缓存（单个模型 2–8 GB），
+# 以及向量索引、微调适配器。这几类一旦提交进去，仓库直接废掉。
+# ============================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 模型与缓存（最危险的一类，务必确认）----------
+# HuggingFace 缓存：BGE-M3 + reranker + Qwen3 加起来十几 G
+hf-cache/
+hf_cache/
+.cache/huggingface/
+models--*/
+# ModelScope 缓存
+.cache/modelscope/
+modelscope-cache/
+# 本项目自己的模型产物
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.gguf
+# LoRA 适配器（体积不大但也不该进仓库；如需交付请单独说明）
+lora_adapter/
+outputs/
+
+# ---------- 向量库与索引 ----------
+# Milvus Lite 是单文件库 + 同名目录，都是运行时产物
+*.db
+*.db.lock
+data/milvus/
+milvus_data/
+# embedding 缓存（可达数百 MB）
+data/chunks/embeddings.npy
+data/chunks/*.npy
+*.faiss
+*.index
+
+# ---------- 数据（按需放开）----------
+# 语料与评测集：这两类是「源资产」，理应进仓库，
+# 所以这里刻意不忽略 data/raw 和 data/eval。
+# 但下面的运行产物要忽略：
+data/sft/*.tmp
+data/eval/results/
+logs/
+*.log
+
+# SQLite 业务库（可重建，进了仓库会天天冲突）
+data/ec.sqlite
+data/*.sqlite
+
+# ---------- macOS / Windows / 编辑器 ----------
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ---------- 本地私有配置 ----------
+.env
+.env.local
+*.local.yaml
+local/

@@ -1,0 +1,153 @@
+# =============================================================
+# 全局配置：所有可调参数集中在这里，禁止散落在代码里。
+# 作用：让「同一份代码 + 不同 yaml」构成可对照的消融实验。
+# =============================================================
+
+project:
+  name: ec-agent-rebuild
+  seed: 42
+
+paths:
+  raw_dir: data/raw                 # 原始规则/FAQ 文本
+  chunk_dir: data/chunks            # 切分产物
+  eval_set: data/eval/testset.jsonl # 评测集（含 gold chunk_id）
+  eval_out: eval/results            # 评测输出目录
+  milvus_uri: data/milvus/ec.db     # Milvus Lite 单文件模式
+  sqlite_uri: data/ec.sqlite        # 业务库（订单/用户/设备/风控/工单）
+  serve_log: logs/serve.jsonl       # 全链路日志落盘位置
+
+# ---------------- 文档切分 ----------------
+chunking:
+  strategy: fixed            # fixed | semantic | parent_child
+  chunk_size: 512            # 固定长度切分的字符数（中文按字计）
+  chunk_overlap: 80
+  min_chunk_size: 80         # 小于此长度的碎块直接合并到前一块
+  semantic_threshold: 0.72   # semantic 策略的相邻句相似度断点阈值
+  parent_size: 1024          # parent_child 策略：父块给模型，子块做检索
+  child_size: 256
+
+# ---------------- 检索：BM25 路 ----------------
+bm25:
+  enabled: true
+  k1: 1.5                    # 词频饱和系数；越大越强调词频
+  b: 0.75                    # 文档长度归一化；0=不归一，1=完全归一
+  tokenizer: jieba           # 中文必须分词，否则 BM25 基本失效
+  stopwords: data/raw/stopwords.txt
+  top_k: 50                  # 粗排召回条数
+
+# ---------------- 检索：稠密向量路 ----------------
+dense:
+  enabled: true
+  backend: milvus_lite       # milvus_lite | milvus | faiss(仅对照)
+  embedding_model: BAAI/bge-m3
+  embedding_device: cuda     # cuda | cpu
+  embedding_dim: 1024        # bge-m3 dense 维度，必须与建库时一致
+  normalize: true            # 向量归一化后内积 == 余弦
+  metric_type: IP
+  top_k: 50
+  score_threshold: 0.6       # 低于此相似度的结果直接丢弃
+  index:
+    type: HNSW               # 本机用 HNSW；IVF_FLAT 留作对照实验
+    M: 16
+    efConstruction: 200
+    ef: 64                   # 检索时的精度/速度旋钮，只在 HNSW 下生效
+  ivf_flat:                  # 仅当 index.type=IVF_FLAT 时生效（对照用）
+    nlist: 2048
+    nprobe: 32
+
+# ---------------- 融合 ----------------
+fusion:
+  method: rrf                # rrf | weighted
+  rrf_k: 60                  # RRF 平滑系数，论文默认 60
+  weighted_alpha: 0.5        # 仅 weighted：alpha*归一化BM25 + (1-alpha)*向量
+  dedup_by: chunk_id
+  # 融合后的候选池大小。注意：这一步决定 Rerank 的调用次数，
+  # 文档里「Top50+Top50 融合后仍取 50 送精排」会拖垮延迟。
+  candidate_k: 30
+
+# ---------------- 精排 ----------------
+rerank:
+  enabled: true
+  model: BAAI/bge-reranker-v2-m3
+  device: cuda
+  top_n: 6                   # 最终入 Prompt 的文档数
+  score_threshold: 0.75      # 低于阈值直接过滤
+  dedup: true
+  batch_size: 8
+
+# ---------------- 大模型 ----------------
+llm:
+  provider: openai_compatible  # openai_compatible | ollama | vllm
+  base_url: http://127.0.0.1:11434/v1
+  model: qwen3:8b              # 本机建议 qwen3:8b / qwen3:14b(4bit)
+  api_key: EMPTY
+  temperature: 0.1             # 风控场景从严
+  top_p: 0.7
+  max_tokens: 1024
+  timeout_s: 30
+  retry: 2
+  # LoRA 微调后的适配器；为空表示用基座模型
+  lora_adapter: ""
+
+# ---------------- Agent ----------------
+agent:
+  max_iter: 5                  # ReAct 最大迭代轮次，防死循环
+  tool_timeout_s: 3            # 单次工具调用超时
+  tool_retry: 2
+  # 三类场景的差异化推理参数
+  scenes:
+    risk:   {temperature: 0.1, top_p: 0.7, tools: [rule_check, query_sql]}
+    account:{temperature: 0.1, top_p: 0.7, tools: [query_sql, rule_check]}
+    service:{temperature: 0.3, top_p: 0.9, tools: [search_kb, query_sql]}
+  fallback_reply: "抱歉，当前无法完成该项处理，已为您转接人工客服。"
+
+# ---------------- 记忆 ----------------
+memory:
+  short_term:
+    backend: memory            # memory | redis
+    redis_url: redis://127.0.0.1:6379/0
+    ttl_minutes: 30
+    max_turns: 12
+  long_term:
+    enabled: true
+    backend: milvus_lite
+    collection: user_memory
+    key_info_threshold: 0.7    # 关键信息抽取相似度阈值
+    recall_top_k: 3            # 跨会话召回条数
+  compression:
+    enabled: true
+    window_turns: 12
+    max_tokens_per_turn: 800
+    max_prompt_tokens: 4000
+    trigger_ratio: 0.8         # 占用达上限 80% 触发压缩
+    redundant_threshold: 0.6   # 相似度高于此值的内容判为冗余剔除
+    keep_keywords: [风控, 订单, 退款, 退货, 账号异常, 拦截, 投诉, 大额, 盗号]
+
+# ---------------- NL2SQL ----------------
+nl2sql:
+  enable: true
+  few_shot_n: 8                # 动态检索注入的示例条数（不是硬塞 200 条进 Prompt）
+  few_shot_pool: data/sft/nl2sql_fewshot.jsonl
+  max_tables: 3                # 最多关联表数
+  max_columns: 20              # 最多查询字段数
+  exec_timeout_s: 2
+  readonly_only: true          # 禁止 drop/delete/update/insert/alter
+  schema_top_k: 6              # schema 检索返回的表数
+  mask_columns: [phone, id_card, address, pay_amount]
+  multi_intent_threshold: 0.6  # 多意图拆解判定阈值
+
+# ---------------- 评测 ----------------
+eval:
+  hit_k: [1, 5, 10, 20, 50]   # HitRate@1 就是文档里说的"Top1命中率"
+  recall_k: [10, 20, 50]
+  mrr_k: 10
+  ndcg_k: 10
+  repeat: 5                    # 生成类指标重复次数取均值，抵消采样随机性
+
+# ---------------- 消融实验分层（L0~L6） ----------------
+ablation:
+  L0_bm25_only:      {bm25: {enabled: true},  dense: {enabled: false}, fusion: {method: rrf},  rerank: {enabled: false}}
+  L1_dense_only:     {bm25: {enabled: false}, dense: {enabled: true},  fusion: {method: rrf},  rerank: {enabled: false}}
+  L2_hybrid_rrf:     {bm25: {enabled: true},  dense: {enabled: true},  fusion: {method: rrf},  rerank: {enabled: false}}
+  L2b_hybrid_weight: {bm25: {enabled: true},  dense: {enabled: true},  fusion: {method: weighted}, rerank: {enabled: false}}
+  L3_hybrid_rerank:  {bm25: {enabled: true},  dense: {enabled: true},  fusion: {method: rrf},  rerank: {enabled: true}}

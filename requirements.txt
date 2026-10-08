@@ -1,0 +1,48 @@
+# 核心依赖。安装顺序很重要：先装 CUDA 版 torch，再装其余。
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# 注：torch 刻意不写在这里，避免被 pip 用 CPU 版覆盖。
+
+# --- 检索 / 向量 ---
+pymilvus>=2.4
+milvus-lite            # Windows 原生装不上，用 faiss-cpu 替代
+faiss-cpu
+jieba>=0.42
+rank-bm25              # 仅用于和自研 BM25 交叉验证，主链路不用
+FlagEmbedding          # BGE-M3 / bge-reranker
+sentence-transformers
+numpy
+
+# --- 工具 / 配置 ---
+PyYAML
+pandas
+tqdm
+rich
+python-dotenv
+
+# --- LLM / Agent ---
+openai                 # 走 OpenAI 兼容协议，Ollama 和 vLLM 都能接
+langchain
+langchain-community
+langgraph
+langchain-openai
+
+# --- NL2SQL ---
+sqlglot
+
+# --- 微调（QLoRA）---
+# ⚠️ 微调依赖已拆到 requirements-finetune.txt，因为有硬版本约束：
+#    transformers 5.19 需要 torch>=2.5，而 cu121 通道最高只到 torch 2.5.1
+#    → 想要新版 transformers 就必须换 cu126 通道
+#    → 且 bitsandbytes 必须 >=0.50.2（旧版在 torch 2.6+ 上会崩）
+#    微调环境请用: pip install -r requirements-finetune.txt
+
+# --- 服务 / 缓存 ---
+fastapi
+uvicorn
+redis                  # 客户端；服务端用 apt install redis-server
+
+# --- 测试 ---
+pytest

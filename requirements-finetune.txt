@@ -1,0 +1,42 @@
+# ============================================================
+# 微调依赖钉版（QLoRA 全链路，逐条核对过 PyPI 元数据）
+#
+# ⚠️ 安装顺序：必须先手工装 CUDA 版 torch，再装本文件。
+#    因为 PyPI 上默认的 torch wheel 是 CPU-only 的，
+#    而本文件里的 torch 钉版行会被忽略（见下方注释）。
+#
+#   # 第一步：看 nvidia-smi 的驱动版本，选通道
+#   pip install torch==2.6.0 torchvision --index-url https://download.pytorch.org/whl/cu126
+#   # 第二步：
+#   pip install -r requirements-finetune.txt
+#
+# 约束链（实测验证）：
+#   torch 2.6.0+cu126
+#     ├─ transformers>=5.19  需要 torch>=2.5          ✅
+#     ├─ bitsandbytes 0.50.2 需要 torch<3,>=2.4       ✅
+#     ├─ peft 0.21.2         需要 torch>=1.13         ✅
+#     ├─ trl 1.14.2          需要 transformers>=4.56.2 ✅
+#     └─ accelerate 1.15.0   需要 torch>=2.0          ✅
+#
+# 若驱动太老只能走 cu121（最高 torch 2.5.1），则改用降级组合：
+#   torch==2.4.1+cu121 + transformers==4.46.*
+#   （4.x 分支没有 torch>=2.5 的要求；代价是 Qwen3 支持可能不够新）
+# ============================================================
+
+# --- 微调核心 ---
+transformers>=5.19,<6
+peft==0.21.2
+trl==1.14.2
+accelerate==1.15.0
+datasets>=2.15.0
+
+# ⚠️ 这条是硬约束：bitsandbytes 0.43 那批在 torch 2.6+ 上会因
+#    PyTorch 移除 torch.utils._pytree._register_pytree_node 而崩溃。
+#    0.50.2 起已修复，且显式声明 torch<3,>=2.4。
+bitsandbytes==0.50.2
+
+# --- 训练监控（可选但建议）---
+tensorboard
+
+# 注意：torch / torchvision 故意不列在这里。
+# pip 无法从这个 index 之外的源装 CUDA 版，必须按上面的命令手工装。

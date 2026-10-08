@@ -1,0 +1,27 @@
+# 跨平台行尾处理。Mac 用 LF、Windows 用 CRLF，
+# 不显式声明的话两边提交会互相"改动整个文件"，diff 变成全红全绿，没法 review。
+* text=auto eol=lf
+
+# 代码与文档统一 LF（Python/JSON/YAML 都能正确处理 LF）
+*.py    text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+*.txt   text eol=lf
+
+# Windows 脚本必须是 CRLF，否则 cmd.exe 可能解析异常
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制文件不做任何行尾转换
+*.npy   binary
+*.db    binary
+*.safetensors binary
+*.bin   binary
+
+# 不要把这些算进语言统计
+docs/**    linguist-documentation
+data/**    linguist-vendored
