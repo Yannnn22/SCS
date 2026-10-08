@@ -143,6 +143,40 @@
 `win/main` 是独立历史，**push 时不需要 `--force`**，也不要试图 rebase 到 `main` 上。
 需要汇总时由用户在本机决定怎么合，**不要自作主张合并**。
 
+### Windows 机器首次配置（只做一次）
+
+```bash
+# ⚠️ 先确认项目根目录【没有】嵌套在外层仓库里。
+# 如果 workspace 本身是个 git 仓库，在这里 git init 会变成嵌套仓库，很麻烦。
+git rev-parse --show-toplevel 2>/dev/null
+# 有输出且不是项目根目录 → 停下来问用户，不要继续
+
+# 1. 探测 SSH 能否连上 GitHub（远端那边已用 SSH 推成功了）
+ssh -o BatchMode=yes -T git@github.com        # 期望: Hi Yannnn22! You've successfully authenticated
+# 不通就先解决密钥，不要改用 HTTPS——HTTPS 需要 token，更麻烦
+
+# 2. 初始化，分支名固定为 win/main（独立起点，不要基于 main）
+cd <项目根目录>
+git init -b win/main
+
+# 3. 身份（用 GitHub noreply 邮箱，与远端一致）
+git config user.name  "Yannnn22"
+git config user.email "Yannnn22@users.noreply.github.com"
+
+# 4. 关联远程
+git remote add origin git@github.com:Yannnn22/SCS.git
+git ls-remote origin                            # 期望看到 refs/heads/main 已存在
+
+# 5. 归档 P0 报告（如果还在工作区外）
+cp <env-report.md 路径> docs/env-report.md
+
+# 6. 首次提交与推送
+git add -A
+git diff --cached --stat                        # ★ 确认无大文件、无模型文件
+git commit -m "P0: 环境搭建完成（8GB 显存 / milvus-lite 可用 / HF 走镜像）"
+git push -u origin win/main
+```
+
 ### 每个 P 阶段结束时
 
 ```bash
