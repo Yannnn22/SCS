@@ -151,43 +151,80 @@ Qwen2.5-0.5B 4bit 单步训练峰值 1.29 GB。**非量化会显著更高。**
 
 ---
 
-## 3. 协作模式：我写，你跑
+## 3. 协作模式：我写并验证，长任务你跑
 
-**我（沙箱）的写入权限：**
+**实测的沙箱写入权限：**
 
 ```
 会话工作区 /Users/Zhuanz/untitled folder/   ✅ 可写
-/tmp                                        ✅ 可写
+/tmp                                        ✅ 可写（pip 缓存也放这）
 $HOME 其他目录                               ❌ 不可写
 /opt/anaconda3/envs                         ❌ 不可写（系统权限）
 ```
 
-**所以我不能**：装 Python 包到全局、建 conda 环境、下载大模型、跑训练。
-**所以我能**：写所有代码、写文档、跑纯标准库的验证、用内置小样例自检逻辑。
+**预判错了一次，已纠正**：一开始以为大 wheel 会被沙箱限速，实测**不是**——
+`torch 2.14.1` 约 200MB 成功装进 `.venv`，只是慢（约 10 分钟）。
+所以**我能装包**，pip 缓存指向工作区即可（全局 pip 缓存不可写）：
+
+```bash
+export PIP_CACHE_DIR="/Users/Zhuanz/untitled folder/.pipcache"
+```
+
+**我能做**：写所有代码与文档；装 pip 包；用内置小样例跑自检；
+跑不依赖大模型的逻辑（BM25、指标计算、切分策略、SQL 校验）。
+**我做不了 / 不该做**：写工作区外的文件；长时间占用机器的训练（会与你的交互冲突）；
+需要人工判断的事（幻觉抽样打分、语义切分的观感评估）。
 
 **分工：**
 
 | 谁 | 做什么 |
 |---|---|
-| 我 | 写/改所有源码与文档；每个模块自带 `if __name__` 自检块；设计实验与验收标准 |
-| 你 | 在终端跑我给的命令；把**实际输出**贴回来；跑长任务（下载、训练） |
+| 我 | 写/改所有源码与文档；装依赖；每个模块自带 `if __name__` 自检并**实际跑通** |
+| 你 | 跑长训练与大批量评测；把**实际输出**贴回来；做需要人判断的评估 |
 
-**每个模块的交付节奏**：我写 → 你跑自检 → 贴输出 → 我据实修 → 再跑。
-**禁止我声称"应该能跑"**，验收一律以你的实际输出为准。
+**验收原则**：我不说"应该能跑"。任何交付我都先自己跑一遍自检，
+跑不了（缺大模型/缺 GPU）就明确标注"未实测，需你验证"。
 
-### 环境现状（需你确认一次）
+### 环境现状（✅ 已实测就绪）
 
-```bash
-# 我在工作区建了 .venv（Python 3.13.2），但装 torch 失败（沙箱限制）
-# 请你在终端执行：
-cd "/Users/Zhuanz/untitled folder/ec-agent-rebuild"
-.venv/bin/python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-.venv/bin/python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
+```
+Python            3.13.2  (.venv，/opt/homebrew/bin/python3.13)
+torch             2.14.1        MPS 实测通过（张量运算 sum=58057.82）
+transformers      5.19.0
+sentence-transformers 6.1.0
+datasets          5.1.0
+peft              0.21.2
+accelerate        1.15.0
+sqlglot           30.21.0
+pymilvus          3.0.2  +  milvus-lite 3.2.1
+langgraph         1.2.14  +  langchain 1.4.3
+jieba / numpy 2.5.3 / pandas 3.0.6 / PyYAML / tqdm / rich
+
+check_env.py 结果：关键项全部 ✅
+  PyTorch 加速后端  torch 2.14.1 | Apple arm (MPS) | 统一内存 ≈16 GB
+  依赖 · 检索/向量/模型/Agent/NL2SQL/微调   全部就绪
+  ⚠️ 依赖 · 4bit 量化   MPS 上不可用（bitsandbytes 为 CUDA-only）→ 走非量化 LoRA
+  向量库 · Milvus Lite  建库/写入/检索全部正常，命中 id=1
 ```
 
-> 注意：Apple Silicon 的 MPS 支持**就在标准 macOS wheel 里**，
-> 不需要 `--index-url` 也自带。上面加 `cpu` 通道只是为了确保拿到 CPU/MPS 版
-> （而不是误装成 CUDA 版）。如果它报找不到，直接 `pip install torch` 即可。
+**额外发现**：`milvus-lite` 在 **ARM macOS** 上也正常工作
+（之前只验证过 Windows 原生可用）。所以向量库这条线在三种平台上都通了：
+Windows x64、ARM macOS、以及 FAISS 兜底。
+
+> ⚠️ **版本比原计划新很多**：torch 2.14.1（不是 2.6.0）、transformers 5.19.0。
+> Apple Silicon 的 MPS 支持就在标准 macOS wheel 里，不需要额外 index-url。
+> 版本跃迁是否引入 API 不兼容，由 `check_finetune_stack.py` 实测验证（进行中）。
+
+> `bitsandbytes` **不装也装不上**——CUDA-only。这不是遗漏，是 Mac 上的硬事实。
+> `trl` 未装（可选）：它提供 `SFTTrainer`；手写 peft 训练循环不需要它。
+
+**conda 路走不通，原因与我无关**：`conda create -n ec` 报
+`NoWritableEnvsDirError`，写不进 `/opt/anaconda3/envs`。`.venv` 已能走通，不修也行：
+
+```bash
+ls -ld /opt/anaconda3/envs
+sudo chown -R $(whoami) /opt/anaconda3/envs
+```
 
 ---
 

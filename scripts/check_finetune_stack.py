@@ -119,6 +119,48 @@ def free_mem() -> None:
 
 
 # --------------------------------------------------------------------------
+def check_hf_cache():
+    """确认 HF 缓存目录可写。
+
+    为什么单列一步：缓存不可写时报的是
+    `OSError: PermissionError ... when downloading ...`，
+    那句话会让人以为是网络问题或模型仓库问题，实际上只是目录权限。
+    早一步拦下来，能省掉一轮排查。
+
+    两种常见的不可写场景：
+      1. 沙箱/受限环境只允许写工作区，而默认缓存落在 ~/.cache/huggingface
+      2. HF_HOME 被指到了一个没有权限的路径
+    """
+    import os
+    from pathlib import Path
+
+    default = Path.home() / ".cache" / "huggingface"
+    hf_home = os.environ.get("HF_HOME")
+    target = Path(hf_home) if hf_home else default / "hub"
+
+    target.mkdir(parents=True, exist_ok=True)
+    probe = target / ".__write_probe"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception as e:  # noqa: BLE001
+        raise PermissionError(
+            f"HF 缓存目录不可写: {target} ({type(e).__name__})\n"
+            f"      修法：把缓存指到可写目录后再跑，例如\n"
+            f"        export HF_HOME=/tmp/hf-cache        # 或工作区内的目录\n"
+            f"      注意：仅看到 'PermissionError when downloading' 不代表网络问题，"
+            f"先查这里。"
+        ) from e
+
+    mirror = os.environ.get("HF_ENDPOINT", "")
+    note = f"HF 缓存可写: {target}"
+    if "hf-mirror" in mirror:
+        note += f" | 镜像: {mirror}"
+    else:
+        note += " | ⚠️ 未设 HF_ENDPOINT 镜像（国内直连 huggingface.co 常超时）"
+    return note
+
+
 def check_versions():
     import torch
     import transformers
@@ -290,6 +332,12 @@ def main():
         print(f"  · {n}")
 
     step("1. 版本与加速后端", check_versions)
+    # 缓存可写是"下载类"步骤的前置条件。它失败时必须【立即终止】，
+    # 否则后面每一步都会重复报同一个下载错误，把真正的原因淹没在噪声里。
+    if not args.load_only:
+        if not step("1b. HF 缓存可写性", check_hf_cache):
+            print("\n⛔ HF 缓存不可写，后续所有下载都会失败。按上面的提示修好再跑。")
+            return 1
 
     if is_quantized():
         if not step("2. bitsandbytes 兼容性", check_bitsandbytes):
