@@ -79,8 +79,38 @@ desktop.ini
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# ---------- 本地私有配置 ----------
+# ---------- 凭据与密钥（★ 安全红线，绝不允许入库）----------
+# AGENTS.md 第 7 节要求「凭据绝对不入库」，光忽略 .env 是不够的：
+# 私钥、证书、云凭据文件都可能被顺手放进项目目录。
 .env
-.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+*_rsa
+*_ed25519
+credentials.json
+service-account*.json
+secrets.yaml
+secrets.yml
+# ⚠️ 刻意不用 *token* / *secret* 这种宽匹配：
+#   会把 HF 的 tokenizer.json / tokenizer_config.json 也误伤，
+#   而微调环节可能正需要提交这类文件。宁可窄一点。
+# SSH / 云 CLI 配置副本（有时会被误拷进来）
+.ssh/
+.aws/
+.azure/
+.gcloud/
+kubeconfig*
+
+# ---------- 本地私有配置 ----------
 *.local.yaml
 local/

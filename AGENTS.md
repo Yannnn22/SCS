@@ -128,7 +128,16 @@
 
 ## 7. Git 协议（两个 agent 必须严格遵守）
 
-远程仓库：`https://github.com/Yannnn22/SCS.git`
+远程仓库（**用 SSH，不要用 HTTPS**）：
+
+```
+git@github.com:Yannnn22/SCS.git
+```
+
+⚠️ **为什么强制 SSH**：实测两台机器上 `github.com` / `api.github.com` /
+`docs.github.com` 的 **HTTPS 域名解析会失败**（`ENOTFOUND`），但 **SSH 通道正常**。
+用 HTTPS 会卡在 DNS 上；而且 HTTPS 还需要 personal access token，多一层凭据管理。
+Windows 侧若 DNS 也不通，见下方「SSH 连不上时」。
 
 ### 核心约束
 
@@ -176,6 +185,42 @@ git diff --cached --stat                        # ★ 确认无大文件、无�
 git commit -m "P0: 环境搭建完成（8GB 显存 / milvus-lite 可用 / HF 走镜像）"
 git push -u origin win/main
 ```
+
+### SSH 连不上时（DNS 解析失败）
+
+`ssh -T git@github.com` 报 `Could not resolve hostname github.com` 时，
+说明本机 DNS 解析不了 GitHub，**不要改用 HTTPS**（同样解析不了，还要多管一个 token）。
+临时绕法是写死 IP：
+
+```sshconfig
+# ~/.ssh/config
+Host github.com
+    HostName 20.205.243.166      # ⚠️ 临时绕过，IP 会变
+    User git
+    IdentityFile ~/.ssh/id_ed25519
+    # ★ 关键：OpenSSH 默认按 HostName 的值去 known_hosts 里查，
+    #   而这里 HostName 是 IP、不是 github.com，不加这行会
+    #   "Host key verification failed"
+    HostKeyAlias github.com
+```
+
+⚠️ **这是临时绕过，不是修复**：IP 会随 GitHub 换节点失效。
+根本解法是让本机 DNS 能解析 `github.com`，届时删掉 `HostName` 那行即可。
+
+**首次连接必须核对主机密钥指纹**（防中间人）：
+
+```bash
+ssh -T git@github.com          # 首次会问 yes/no
+# 或事后核对：
+ssh-keygen -lf ~/.ssh/known_hosts | grep github
+```
+
+GitHub 的 ED25519 指纹为：
+`SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`
+
+独立核对渠道（二选一，**别只信 known_hosts 里的缓存——那不能自证**）：
+- <https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints>
+- 手机流量访问 GitHub 文档（避开本机 DNS 问题）
 
 ### 每个 P 阶段结束时
 
