@@ -1,25 +1,33 @@
-"""微调链路验证：在真正开训之前，用 0.5B 小模型跑通全链路。
+"""微调链路验证：在真正开训之前，用小模型把全链路跑通。
 
-为什么必须先做这一步：QLoRA 涉及的每个库都是"版本敏感"的，
+为什么必须先做这一步：微调涉及的每个库都是"版本敏感"的，
 torch / transformers / bitsandbytes / peft 四者之间任意一个版本错配，
 都会在**不同的阶段**报错（加载时、量化时、前向时、反向时）。
 用 0.5B 模型跑一遍只要几分钟，能把所有版本问题一次暴露出来，
 而不是等下载完 8G 的 Qwen3-4B、训了 20 分钟后才崩在 backward。
 
+★ 后端无关（本脚本同时服务两台机器）：
+    CUDA（RTX 4060 8GB）  → QLoRA：4bit NF4 + double quant + grad ckpt
+    MPS （Apple M1 16GB） → LoRA ：非量化 fp16（**bitsandbytes 是 CUDA-only，Mac 上装不了**）
+    CPU                   → 仅验证流程，速度无参考价值
+
 用法：
-    python scripts/check_finetune_stack.py
+    python scripts/check_finetune_stack.py                       # 自动选后端
     python scripts/check_finetune_stack.py --model Qwen/Qwen2.5-0.5B-Instruct
+    python scripts/check_finetune_stack.py --load-only           # 只查版本，不下载模型
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import traceback
 
 OK, FAIL = "\033[32m✅\033[0m", "\033[31m❌\033[0m"
 
 steps: list[tuple[str, str, str]] = []
+DEVICE = None  # 由 main() 填入 src.utils.device.DeviceInfo
 
 
 def step(name: str, fn):
@@ -32,8 +40,7 @@ def step(name: str, fn):
         return True
     except Exception as e:  # noqa: BLE001 - 校验脚本就是要兜住一切
         tb = traceback.format_exc()
-        # 只留最后两行，完整栈写文件便于排查
-        last = [l for l in tb.strip().splitlines() if l.strip()][-2:]
+        last = [line for line in tb.strip().splitlines() if line.strip()][-2:]
         detail = f"{type(e).__name__}: {e}"
         steps.append((FAIL, name, detail))
         print(f"{FAIL} {detail}")
@@ -43,50 +50,115 @@ def step(name: str, fn):
 
 
 # --------------------------------------------------------------------------
+# 后端相关的两个开关：是否量化、用什么 dtype
+# --------------------------------------------------------------------------
+def is_quantized() -> bool:
+    """是否走 4bit 量化（QLoRA）。MPS 上必然为 False。"""
+    return bool(DEVICE and DEVICE.supports_4bit)
+
+
+def load_kwargs() -> dict:
+    """按后端拼出 from_pretrained 的加载参数。"""
+    import torch
+
+    kw: dict = {"device_map": {"": DEVICE.device} if DEVICE.backend == "cuda" else None}
+    if DEVICE.backend == "cuda":
+        kw["device_map"] = {"": 0}
+    if is_quantized():
+        from transformers import BitsAndBytesConfig
+
+        kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        # 非量化：MPS 上 float16 比 bfloat16 稳，CPU 只能用 float32
+        if DEVICE.backend == "mps":
+            kw["torch_dtype"] = torch.float16
+        elif DEVICE.backend == "cpu":
+            kw["torch_dtype"] = torch.float32
+        else:
+            kw["torch_dtype"] = torch.bfloat16
+    return kw
+
+
+def peak_mem_gb() -> float:
+    """读取峰值内存占用。CUDA 有专用 API，MPS/CPU 没有等价物。"""
+    import torch
+
+    if DEVICE.backend == "cuda":
+        return torch.cuda.max_memory_allocated() / 1024**3
+    # MPS 无 max_memory_allocated；用当前分配量近似（会低估峰值）
+    if DEVICE.backend == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+        return torch.mps.current_allocated_memory() / 1024**3
+    return 0.0
+
+
+def reset_peak() -> None:
+    import torch
+
+    if DEVICE.backend == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+
+def free_mem() -> None:
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if DEVICE.backend == "cuda":
+            torch.cuda.empty_cache()
+        elif DEVICE.backend == "mps" and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------
 def check_versions():
     import torch
     import transformers
 
-    assert torch.cuda.is_available(), (
-        "CUDA 不可用！常见原因：装成了 CPU 版 torch（漏了 --index-url），"
-        "或 Windows 侧驱动过旧。这一步不过，后面全部无意义。"
+    assert DEVICE.backend != "cpu", (
+        "既没有 CUDA 也没有 MPS，退到了 CPU。流程能跑但慢到没有参考价值；"
+        "如果这是 Mac，检查 torch 是否是官方 wheel（MPS 需要 macOS 12.3+ 与 arm64 wheel）"
     )
-    assert tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 5), (
-        f"torch {torch.__version__} < 2.5，新版 transformers 需要 >=2.5。"
-        "注意 cu121 通道最高只到 2.5.1，升 torch 必须同时换 CUDA 通道。"
-    )
+    if is_quantized():
+        assert tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 5), (
+            f"torch {torch.__version__} < 2.5，新版 transformers 需要 >=2.5。"
+            "注意 cu121 通道最高只到 2.5.1，升 torch 必须同时换 CUDA 通道。"
+        )
+    mode = "QLoRA(4bit)" if is_quantized() else "LoRA(非量化)"
     return (
         f"torch {torch.__version__} | transformers {transformers.__version__} | "
-        f"{torch.cuda.get_device_name(0)} | {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB"
+        f"{DEVICE.name} | ≈{DEVICE.memory_gb:.1f} GB | 模式={mode}"
     )
 
 
 def check_bitsandbytes():
-    import bitsandbytes as bnb
-    import torch
+    """只在 4bit 可用时才是硬检查；Mac 上跳过并说明原因。"""
+    import bitsandbytes as bnb  # noqa: F401
 
-    # 这条是历史大坑：torch 2.6 移除了 _register_pytree_node 私有 API，
-    # 老版 bitsandbytes 在这里就会炸。0.50.2+ 已修。
     assert bnb.__version__ >= "0.50.2", (
         f"bitsandbytes {bnb.__version__} 过旧。torch 2.6+ 需 >=0.50.2，"
         "否则会在 pytree 相关调用上崩溃。"
     )
-    # 实际功能探测，比只读版本号可靠
-    assert bnb.functional is not None, "bnb.functional 不可导入"
-    _ = torch.zeros(4, device="cuda")
     return f"bitsandbytes {bnb.__version__}，functional 可导入"
 
 
 def check_4bit_quant():
-    """最关键的一步：真做一次 4bit 量化，把 bitsandbytes + torch 的兼容性打实。"""
     import torch
     from transformers import BitsAndBytesConfig
 
     cfg = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",          # QLoRA 标准
+        bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,     # 省显存；8G 卡上必须开
+        bnb_4bit_use_double_quant=True,
     )
     assert cfg.load_in_4bit and cfg.bnb_4bit_quant_type == "nf4"
     return "BitsAndBytesConfig(NF4 + double quant + bf16) 构造成功"
@@ -95,109 +167,144 @@ def check_4bit_quant():
 def check_model_load(model_name: str):
     """加载模型 + 真做一次前向，验证 transformers 认识这个架构。"""
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    kw = load_kwargs()
+    if kw.get("device_map") is None:
+        kw.pop("device_map", None)
 
     tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, quantization_config=bnb, device_map={"": 0}, trust_remote_code=True
-    )
-    inputs = tok("测试", return_tensors="pt").to("cuda")
+    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, **kw)
+    if DEVICE.backend != "cuda":
+        model = model.to(DEVICE.device)
+
+    inputs = tok("测试", return_tensors="pt").to(DEVICE.device)
     with torch.no_grad():
         out = model(**inputs)
     assert out.logits is not None
-    vram = torch.cuda.max_memory_allocated() / 1024**3
-    del model
-    torch.cuda.empty_cache()
-    return f"{model_name} 4bit 加载 + 前向成功，峰值显存 {vram:.2f} GB"
+
+    # 关键：显式跑一次 backward 用的图，确认该后端支持训练而非仅推理
+    peak = peak_mem_gb()
+    del out
+    free_mem()
+    return f"{model_name} 加载 + 前向成功（{'量化' if is_quantized() else '非量化'}），当前占用 {peak:.2f} GB"
 
 
 def check_lora_attach(model_name: str):
-    """挂 LoRA 并确认可训练参数量——QLoRA 的核心机制。"""
-    import torch
+    """挂 LoRA 并确认可训练参数量——这是微调的核心机制。"""
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, quantization_config=bnb, device_map={"": 0}, trust_remote_code=True
-    )
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    kw = load_kwargs()
+    if kw.get("device_map") is None:
+        kw.pop("device_map", None)
+    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, **kw)
+    if DEVICE.backend != "cuda":
+        model = model.to(DEVICE.device)
+
+    # prepare_model_for_kbit_training 只对量化模型有意义。
+    # 非量化时也必须开 gradient checkpointing，否则 16G 内存装不下激活值。
+    if is_quantized():
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    else:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+
     cfg = LoraConfig(
         r=8, lora_alpha=16, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # 与项目配置一致
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
     model = get_peft_model(model, cfg)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    ratio = trainable / total * 100
     del model
-    torch.cuda.empty_cache()
-    return f"LoRA r=8/alpha=16 挂载成功，可训练参数 {trainable:,} / {total:,} = {ratio:.3f}%"
+    free_mem()
+    return f"LoRA r=8/alpha=16 挂载成功，可训练参数 {trainable:,} / {total:,} = {trainable / total * 100:.3f}%"
 
 
 def check_train_step(model_name: str):
     """最硬的验证：真跑一次反向传播。前向过了不代表能训。"""
     import torch
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    kw = load_kwargs()
+    if kw.get("device_map") is None:
+        kw.pop("device_map", None)
 
     tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, quantization_config=bnb, device_map={"": 0}, trust_remote_code=True
-    )
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, **kw)
+    if DEVICE.backend != "cuda":
+        model = model.to(DEVICE.device)
+
+    if is_quantized():
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    else:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+
     model = get_peft_model(model, LoraConfig(
         r=8, lora_alpha=16, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     ))
     model.train()
+    reset_peak()
+
     batch = tok(["订单退款需要三个工作日到账。"], return_tensors="pt",
-                padding=True, truncation=True, max_length=64).to("cuda")
+                padding=True, truncation=True, max_length=64).to(DEVICE.device)
     batch["labels"] = batch["input_ids"].clone()
+
     out = model(**batch)
     loss_val = out.loss.item()
     out.loss.backward()
-    peak = torch.cuda.max_memory_allocated() / 1024**3
+    peak = peak_mem_gb()
     assert loss_val == loss_val, "loss 是 NaN"
     del model, out
-    torch.cuda.empty_cache()
-    return f"完整训练步（前向+反向）成功，loss={loss_val:.4f}，峰值显存 {peak:.2f} GB"
+    free_mem()
+    return f"完整训练步（前向+反向）成功，loss={loss_val:.4f}，峰值占用 {peak:.2f} GB"
 
 
 def main():
+    global DEVICE
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct",
                     help="用小模型验证链路，别拿 4B 试错")
     ap.add_argument("--load-only", action="store_true", help="只查版本，不下载模型")
     args = ap.parse_args()
 
-    print("=" * 72)
-    print("微调链路验证（QLoRA 全链路）")
-    print("=" * 72)
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from src.utils.device import detect
 
-    step("1. 版本与 CUDA 可用性", check_versions)
-    if not step("2. bitsandbytes 兼容性", check_bitsandbytes):
-        print("\n⛔ bitsandbytes 不过，后面全部无意义，先修这个。")
-        return 1
-    step("3. 4bit 量化配置", check_4bit_quant)
+    DEVICE = detect()
+
+    print("=" * 72)
+    print("微调链路验证（后端无关：CUDA→QLoRA / MPS→LoRA / CPU→仅流程）")
+    print("=" * 72)
+    print(f"后端: {DEVICE.backend} | 设备: {DEVICE.name} | 内存 ≈{DEVICE.memory_gb:.1f} GB "
+          f"| 4bit 可用: {DEVICE.supports_4bit}")
+    for n in DEVICE.notes:
+        print(f"  · {n}")
+
+    step("1. 版本与加速后端", check_versions)
+
+    if is_quantized():
+        if not step("2. bitsandbytes 兼容性", check_bitsandbytes):
+            print("\n⛔ bitsandbytes 不过，后面全部无意义，先修这个。")
+            return 1
+        step("3. 4bit 量化配置", check_4bit_quant)
+    else:
+        print(f"\n--- 2/3. 跳过 bitsandbytes 与 4bit 检查 ---")
+        print(f"{OK} 当前后端（{DEVICE.backend}）不支持 4bit，走非量化 LoRA，属预期行为")
+        steps.append((OK, "2/3. 量化检查", f"{DEVICE.backend} 无 bitsandbytes，改用非量化 LoRA"))
 
     if args.load_only:
         print("\n(--load-only，跳过模型加载与训练步)")
     else:
-        step("4. 模型 4bit 加载 + 前向", lambda: check_model_load(args.model))
+        step("4. 模型加载 + 前向", lambda: check_model_load(args.model))
         step("5. LoRA 挂载", lambda: check_lora_attach(args.model))
         step("6. 完整训练步（前向+反向）", lambda: check_train_step(args.model))
 
@@ -213,7 +320,7 @@ def main():
         print(f"有 {len(failed)} 步失败：{[r[1] for r in failed]}")
         print("先修这些再开训，否则会在下载完大模型后才崩。")
         return 1
-    print("全链路通过，可以开始真正的 QLoRA 训练了。")
+    print(f"全链路通过（模式：{'QLoRA 4bit' if is_quantized() else 'LoRA 非量化'}），可以开始真正的微调了。")
     return 0
 
 
