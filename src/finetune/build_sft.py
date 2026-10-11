@@ -165,16 +165,33 @@ def build_samples(json_ratio: float, rng: random.Random, target_n: int = 400) ->
         return list(dict.fromkeys([o for o in out if o and o.endswith(("？", "?"))]))
 
     # 答法变体：同一份事实，三种呈现风格
-    #   为什么要有这个：真实客服回复有长有短。只训一种风格，
-    #   模型会变得死板（永远输出同样长度和结构）。
+    #
+    #   为什么要有这个：真实客服回复有长有短，只训一种风格模型会变得死板。
+    #
+    #   ★ 这里我第一版写错了，值得记下来：
+    #     第一版用 `lines[0]`（第一行）做"简洁版"。但多行答案的第一行
+    #     往往只是开场白，砍掉的是**关键信息**：
+    #         完整: "您好，平台支持价格保护。\n条件：签收后15天内降价...\n流程：..."
+    #         简洁: "您好，平台支持价格保护。"     ← "条件"和"流程"全丢了
+    #     结果是模型学到"遇到问题就答一句空话"，直接伤害评测。
+    #
+    #   正确做法：简洁版必须**保留每行的要点**，只压缩措辞。
     def a_variants(answer: str) -> list[str]:
         lines = [l for l in answer.split("\n") if l.strip()]
-        brief = lines[0] if lines else answer
-        # 简洁版：只留结论
-        short = brief
-        # 加礼貌前缀版
-        polite = "您好，为您解答：\n" + answer
-        return list(dict.fromkeys([answer, short, polite]))
+        out = [answer]                                  # 完整版
+        out.append("您好，为您解答：\n" + answer)        # 礼貌前缀版（教模型加敬语）
+
+        if len(lines) > 1:
+            # 要点版：逐行取每行的核心（去掉行首的"条件：""流程："等标签后保留内容），
+            # 但【不丢行】——每行都保留，只是措辞更紧。
+            core = []
+            for l in lines:
+                # 保留标签（它本身就是结构信息，模型该学会用），只去掉冗余修饰
+                core.append(l.replace("非常抱歉，", "").replace("您好，", "").strip())
+            merged = "；".join(core)
+            if merged != answer:
+                out.append(merged)
+        return list(dict.fromkeys([o for o in out if o.strip()]))
 
     samples: list[dict] = []
 
