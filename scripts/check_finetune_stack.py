@@ -84,23 +84,23 @@ def load_kwargs() -> dict:
     return kw
 
 
-def peak_mem_gb() -> float:
-    """读取峰值内存占用。CUDA 有专用 API，MPS/CPU 没有等价物。"""
+def peak_mem_gb() -> tuple[float, str]:
+    """读取内存占用，并【如实告知这是峰值还是当前值】。
+
+    为什么返回 (值, 口径) 而不只返回值：
+        CUDA 有 max_memory_allocated()，是真正的峰值统计；
+        MPS 只有 current_allocated_memory()，是【瞬时】占用。
+        把两者都叫"峰值"会让跨平台对比失真 —— 之前就踩过：
+        Mac 报 0.95 GB 被当成峰值，与 Windows 的 1.29 GB 真峰值直接比，
+        结论会偏。所以这里把口径一并返回，让调用方必须显式处理。
+    """
     import torch
 
     if DEVICE.backend == "cuda":
-        return torch.cuda.max_memory_allocated() / 1024**3
-    # MPS 无 max_memory_allocated；用当前分配量近似（会低估峰值）
+        return torch.cuda.max_memory_allocated() / 1024**3, "峰值"
     if DEVICE.backend == "mps" and hasattr(torch.mps, "current_allocated_memory"):
-        return torch.mps.current_allocated_memory() / 1024**3
-    return 0.0
-
-
-def reset_peak() -> None:
-    import torch
-
-    if DEVICE.backend == "cuda":
-        torch.cuda.reset_peak_memory_stats()
+        return torch.mps.current_allocated_memory() / 1024**3, "当前(非峰值)"
+    return 0.0, "不可测"
 
 
 def free_mem() -> None:
@@ -116,6 +116,29 @@ def free_mem() -> None:
             torch.mps.empty_cache()
     except Exception:  # noqa: BLE001
         pass
+
+
+def process_mem_gb() -> float:
+    """整个进程的常驻内存（RSS）。这是统一内存机器上更诚实的指标。
+
+    MPS 的 current_allocated_memory 只统计 MPS 分配器手上的张量，
+    不含 Python 堆、库、以及 MPS 未归还的缓存。
+    在 16GB 统一内存的 M1 上，RSS 才是我真正要盯的数字。
+    """
+    try:
+        import resource
+
+        # macOS 上 ru_maxrss 单位是字节（Linux 上是 KB），macOS 专用本脚本
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**3
+    except Exception:  # noqa: BLE001
+        try:
+            import os
+
+            import psutil  # type: ignore
+
+            return psutil.Process(os.getpid()).memory_info().rss / 1024**3
+        except Exception:  # noqa: BLE001
+            return 0.0
 
 
 # --------------------------------------------------------------------------
@@ -226,10 +249,14 @@ def check_model_load(model_name: str):
     assert out.logits is not None
 
     # 关键：显式跑一次 backward 用的图，确认该后端支持训练而非仅推理
-    peak = peak_mem_gb()
+    mem, basis = peak_mem_gb()
+    rss = process_mem_gb()
     del out
     free_mem()
-    return f"{model_name} 加载 + 前向成功（{'量化' if is_quantized() else '非量化'}），当前占用 {peak:.2f} GB"
+    return (
+        f"{model_name} 加载 + 前向成功（{'量化' if is_quantized() else '非量化'}）"
+        f"，MPS/GPU {basis} {mem:.2f} GB，进程 RSS {rss:.2f} GB"
+    )
 
 
 def check_lora_attach(model_name: str):
@@ -293,7 +320,6 @@ def check_train_step(model_name: str):
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     ))
     model.train()
-    reset_peak()
 
     batch = tok(["订单退款需要三个工作日到账。"], return_tensors="pt",
                 padding=True, truncation=True, max_length=64).to(DEVICE.device)
@@ -302,11 +328,15 @@ def check_train_step(model_name: str):
     out = model(**batch)
     loss_val = out.loss.item()
     out.loss.backward()
-    peak = peak_mem_gb()
+    mem, basis = peak_mem_gb()
+    rss = process_mem_gb()
     assert loss_val == loss_val, "loss 是 NaN"
     del model, out
     free_mem()
-    return f"完整训练步（前向+反向）成功，loss={loss_val:.4f}，峰值占用 {peak:.2f} GB"
+    return (
+        f"完整训练步（前向+反向）成功，loss={loss_val:.4f}"
+        f"，MPS/GPU {basis} {mem:.2f} GB，进程 RSS {rss:.2f} GB"
+    )
 
 
 def main():

@@ -151,80 +151,94 @@ Qwen2.5-0.5B 4bit 单步训练峰值 1.29 GB。**非量化会显著更高。**
 
 ---
 
-## 3. 协作模式：我写并验证，长任务你跑
+## 3. 协作模式：先解释后执行（★ 这条是用户明确要求的）
 
-**实测的沙箱写入权限：**
+**背景**：项目前期我（AI）在自问自答地干活——改配置、修脚本、装依赖、跑验证，
+然后把「已完成」的结论丢出来。结果用户看不到任何决策过程，学不到东西。
+**这是错误的。** 用户的目标是**通过动手搞懂**，不是拿到一个能跑的仓库。
+
+### 铁律：每一步的固定顺序
+
+**不允许"先做完再解释"。** 每推进一个步骤，按这个顺序走：
 
 ```
-会话工作区 /Users/Zhuanz/untitled folder/   ✅ 可写
-/tmp                                        ✅ 可写（pip 缓存也放这）
-$HOME 其他目录                               ❌ 不可写
-/opt/anaconda3/envs                         ❌ 不可写（系统权限）
+① 讲解：我要做什么 + 为什么这么做 + 涉及哪些参数 + 每个参数的含义与取值范围
+        （写成你能看懂的说明，不要只丢命令）
+
+② 预告：预期看到什么输出、什么是成功、什么是失败
+
+③ 暂停：等你确认（有疑问就问，有问题就改）
+
+④ 执行：跑命令，贴出实际输出（不修饰、不省略失败信息）
+
+⑤ 复盘：实际结果与预期是否一致；不一致就分析原因；
+        把实测数字填进学习日志
 ```
 
-**预判错了一次，已纠正**：一开始以为大 wheel 会被沙箱限速，实测**不是**——
-`torch 2.14.1` 约 200MB 成功装进 `.venv`，只是慢（约 10 分钟）。
-所以**我能装包**，pip 缓存指向工作区即可（全局 pip 缓存不可写）：
+**为什么必须先讲解再执行**：如果先跑完再补解释，用户看到的是"事后合理化"，
+而不是"面对未知时的决策过程"——而**后者才是真正要学的东西**。
+真实的工程判断发生在信息不全的时候。
 
-```bash
-export PIP_CACHE_DIR="/Users/Zhuanz/untitled folder/.pipcache"
-```
+### 输出形态
 
-**我能做**：写所有代码与文档；装 pip 包；用内置小样例跑自检；
-跑不依赖大模型的逻辑（BM25、指标计算、切分策略、SQL 校验）。
-**我做不了 / 不该做**：写工作区外的文件；长时间占用机器的训练（会与你的交互冲突）；
-需要人工判断的事（幻觉抽样打分、语义切分的观感评估）。
-
-**分工：**
-
-| 谁 | 做什么 |
+| 情况 | 我给什么 |
 |---|---|
-| 我 | 写/改所有源码与文档；装依赖；每个模块自带 `if __name__` 自检并**实际跑通** |
-| 你 | 跑长训练与大批量评测；把**实际输出**贴回来；做需要人判断的评估 |
+| 技术决策 | 观察 → 候选方案对比表 → 为什么选它 → 代价是什么 |
+| 参数 | 含义、取值、取值范围、怎么调、调错会怎样 |
+| 命令 | 命令本身 + **逐行解释** + 预期输出 |
+| 结果 | 实际输出原文 + 与预期的差异 + 下一步判断 |
+| 原理 | 单独成节，配可验证的推算（不是只说结论） |
 
-**验收原则**：我不说"应该能跑"。任何交付我都先自己跑一遍自检，
-跑不了（缺大模型/缺 GPU）就明确标注"未实测，需你验证"。
+**配套文档**：[`learning-log.md`](learning-log.md) —— 每个"为什么"摊开写，
+要求：**参数含义 + 怎么自己验证 + 我犯过的错**。
 
-### 环境现状（✅ 已实测就绪）
+### 我仍然要做的自我约束
+
+- 长时间任务放后台并**说明它在跑什么、大概多久**，不静默阻塞
+- 任何"跑通了"的声明都附**实际输出**
+- 跑不了的（内存不够、缺模型）明确标注「未实测」
+- **我的判断错了要主动报告**，并写进 learning-log 的失误清单
+
+---
+
+## 3.5 环境与权限现状（2026-10 实测）
+
+**权限**：DSH 文件策略为 `danger-full-access`，工作区内外均可写。
+（此前曾误判为"只能写工作区"，已在 learning-log 失误清单中记录。）
+
+**环境（.venv，Python 3.13.2 @ `/opt/homebrew/bin/python3.13`）**：
 
 ```
-Python            3.13.2  (.venv，/opt/homebrew/bin/python3.13)
-torch             2.14.1        MPS 实测通过（张量运算 sum=58057.82）
+torch             2.14.1        MPS 实测通过
 transformers      5.19.0
 sentence-transformers 6.1.0
 datasets          5.1.0
 peft              0.21.2
 accelerate        1.15.0
 sqlglot           30.21.0
-pymilvus          3.0.2  +  milvus-lite 3.2.1
-langgraph         1.2.14  +  langchain 1.4.3
+pymilvus 3.0.2 + milvus-lite 3.2.1
+langgraph 1.2.14 + langchain 1.4.3
 jieba / numpy 2.5.3 / pandas 3.0.6 / PyYAML / tqdm / rich
 
-check_env.py 结果：关键项全部 ✅
-  PyTorch 加速后端  torch 2.14.1 | Apple arm (MPS) | 统一内存 ≈16 GB
-  依赖 · 检索/向量/模型/Agent/NL2SQL/微调   全部就绪
-  ⚠️ 依赖 · 4bit 量化   MPS 上不可用（bitsandbytes 为 CUDA-only）→ 走非量化 LoRA
-  向量库 · Milvus Lite  建库/写入/检索全部正常，命中 id=1
+check_env.py：关键项全部 ✅
+check_finetune_stack.py（0.5B）：全链路通过，LoRA 可训练参数 1,081,344
 ```
 
-**额外发现**：`milvus-lite` 在 **ARM macOS** 上也正常工作
-（之前只验证过 Windows 原生可用）。所以向量库这条线在三种平台上都通了：
-Windows x64、ARM macOS、以及 FAISS 兜底。
+**额外发现**：`milvus-lite` 在 **ARM macOS** 上也正常（此前只验证过 Windows 原生）。
+向量库在三种平台上都通了：Windows x64、ARM macOS、FAISS 兜底。
 
-> ⚠️ **版本比原计划新很多**：torch 2.14.1（不是 2.6.0）、transformers 5.19.0。
+> ⚠️ 版本比原计划新很多：torch 2.14.1（不是 2.6.0）。
 > Apple Silicon 的 MPS 支持就在标准 macOS wheel 里，不需要额外 index-url。
-> 版本跃迁是否引入 API 不兼容，由 `check_finetune_stack.py` 实测验证（进行中）。
-
-> `bitsandbytes` **不装也装不上**——CUDA-only。这不是遗漏，是 Mac 上的硬事实。
+>
+> `bitsandbytes` **不装也装不上**——CUDA-only，这是 Mac 上的硬事实。
 > `trl` 未装（可选）：它提供 `SFTTrainer`；手写 peft 训练循环不需要它。
 
-**conda 路走不通，原因与我无关**：`conda create -n ec` 报
-`NoWritableEnvsDirError`，写不进 `/opt/anaconda3/envs`。`.venv` 已能走通，不修也行：
+**HF 缓存**：`~/.cache/huggingface` 现在可写。
+之前因为不可写设了 `HF_HOME=/tmp/hf-cache`，现在两种都行。
+⚠️ 国内直连 `huggingface.co` 常超时，建议设 `HF_ENDPOINT=https://hf-mirror.com`。
 
-```bash
-ls -ld /opt/anaconda3/envs
-sudo chown -R $(whoami) /opt/anaconda3/envs
-```
+**conda**：`/opt/anaconda3/envs` 现在可写，`conda create -n ec` 应该能成。
+但 `.venv` 已跑通全部验证，**迁到 conda 是纯折腾**，建议不动。
 
 ---
 
